@@ -1,0 +1,58 @@
+{
+    "Static": {
+        "Title": "User Title",
+        "Company": "My Organization",
+        "State": "ST",
+        "Country": "US",
+        "EmailDomain": "company.com",
+        "DefaultPasswordPrefix": "password"
+    },
+    "ActiveDirectory": {
+        "Server": "My Active Directory Server",
+        "UserOrgRoot": "OU=My Users,DC=domain,DC=local",
+        "DisabledObjectOrg": "OU=Disabled Objects,DC=domain,DC=local",
+        "AADSyncServer": "My AAD Sync Server",
+        "UserProperties": [
+            "EmployeeId",
+            "DisplayName",
+            "GivenName",
+            "Surname",
+            "UserPrincipalName",
+            "Description",
+            "Office",
+            "StreetAddress",
+            "City",
+            "State",
+            "PostalCode",
+            "Title",
+            "Company",
+            "Country",
+            "Enabled"
+        ]
+    },
+    "Buildings": {
+        "Building 1": {
+            "City": "Funny Town 1",
+            "Address": "100 Cool Road",
+            "Zip": "99999"
+        },
+        "Building 2": {
+            "City": "Funny Town 2",
+            "Address": "200 Fun Road",
+            "Zip": "99999"
+        }
+    },
+    "Groups": {
+        "Group1": "Example Group"
+    },
+    "Descriptions": {
+        "Building 1": {
+            "Course 1": "My very exciting course #1",
+            "Course 2": "My very exciting course #2"
+        },
+        "Building 2": {
+            "Course 1": "Wow, I can't believe it's not boring #1",
+            "Course 2": "Can you believe this class is fun!? #2"
+        }
+    }
+}

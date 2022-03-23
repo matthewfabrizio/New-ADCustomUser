@@ -48,6 +48,8 @@ function Get-InactiveADUsers {
         - Add a specific word to the AD object that can be used in an exclude
             - ex. Office can be set to Generic. Get-ADUser is then set to exclude accounts with Office = Generic
             - Downside is that you always have to remember to enter this field or your account will get disabled the next day.
+        - Accounts could be placed in a different OU outside of SearchBase
+            - Downside is that generic accounts are usually applied a group policy, you would then need to delegate to specific GPOs which is just more maintenance
     #>
 
     # take $Users and move (Move-ADObject) to the disabled accounts org (specify in config)
@@ -102,7 +104,6 @@ function Test-OrganiztionalUnit {
 
     try {
         Get-ADOrganizationalUnit -Identity $OUPath | Out-Null
-        "LOG : $OUPath already exists."
     }
     catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
         "LOG : Creating $OUPath."
@@ -282,9 +283,13 @@ function Compare-UserProperties {
         $DifferenceData
     )
     
-    # create blank objects
+    # create blank objects for data comparison
     $ReferenceObject = [PSCustomObject]@{}
     $DifferenceObject = [PSCustomObject]@{}
+
+    # two objects because splats only accept hashtables and couldn't add multiple values to pscustomobject log
+    $ADPropertyObject = [PSCustomObject]@{}
+    $ADPropertyHash = [hashtable]@{}
 
     # populate blank objects with defined data
     $UserInfo.ActiveDirectory.UserProperties | ForEach-Object {
@@ -292,55 +297,46 @@ function Compare-UserProperties {
         $DifferenceObject | Add-Member -Name $PSItem -MemberType NoteProperty -Value $DifferenceData.$PSItem
     }
 
+    # compare the reference and difference data
     $Compare = (Compare-ObjectData -ReferenceObject $ReferenceObject -DifferenceObject $DifferenceObject -Compact)
 
     # check if user is in wrong org unit
     $UserDataDistinguishedName = ($DifferenceData.DistinguishedName -replace '^.+?(?<!\\),', '')
     if ($UserData.Path -ne $UserDataDistinguishedName) {
-        "LOG : Difference in [DistinguishedName]. Modifying [$UserDataDistinguishedName] to [$($UserData.Path)]"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "OrgAction" -Value "Move"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "CurrentOrg" -Value $UserDataDistinguishedName
+        $LogObject | Add-Member -MemberType NoteProperty -Name "DestinationOrg" -Value $UserData.Path
+
         $DifferenceData | Move-ADObject -TargetPath $UserData.Path -Server $Server -Credential $Credential -WhatIf:$WhatIfPreference
+    }
+    # log no org move
+    else {
+        $LogObject | Add-Member -MemberType NoteProperty -Name "OrgAction" -Value "None"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "CurrentOrg" -Value $UserDataDistinguishedName
+        $LogObject | Add-Member -MemberType NoteProperty -Name "DestinationOrg" -Value "None"
+    }
+
+    # Build the log object and splat object
+    $Compare | ForEach-Object {
+        $ADPropertyObject | Add-Member -MemberType NoteProperty -Name $PSItem.Property -Value $PSItem.ReferenceValue
+        $ADPropertyHash.Add($PSItem.Property, $PSItem.ReferenceValue)
     }
 
     # if one or more fields are different, modify them
     if ($Compare) {
-        $Compare | ForEach-Object {
-            "LOG : Difference in [$($PSItem.Property)]. Modifying [$($PSItem.DifferenceValue)] to [$($PSItem.ReferenceValue)]"
+        # log attribute changes
+        $LogObject | Add-Member -MemberType NoteProperty -Name "AttributeAction" -Value "Update"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "Attribute" -Value ($ADPropertyObject.PSObject.Properties.Name -join ',')
+        $LogObject | Add-Member -MemberType NoteProperty -Name "Values" -Value ($ADPropertyObject.PSObject.Properties.Value -join ',')
 
-            $SetADUserSplat = @{
-                $PSItem.Property = $PSItem.ReferenceValue
-            }
-
-            $DifferenceData | Set-ADUser @SetADUserSplat -Server $Server -Credential $Credential -WhatIf:$WhatIfPreference
-        }
+        # set attribute changes
+        $DifferenceData | Set-ADUser @ADPropertyHash -Server $Server -Credential $Credential -WhatIf:$WhatIfPreference -Verbose
     }
     # if no fields are different, log no changes
     else {
-        "LOG : All AD user properties for [$($UserData.DisplayName)] are up to date"
-    }
-}
-
-<#
-.SYNOPSIS
-Starts AAD Sync
-
-.DESCRIPTION
-Starts AAD Sync
-
-.EXAMPLE
-Start-AADConnectDeltaSync
-
-.NOTES
-WIP
-#>
-function Start-AADConnectDeltaSync {
-    param ()
-    "LOG : Starting delta sync..."
-    $sync = Invoke-Command -ComputerName $UserInfo.ActiveDirectory.AADSyncServer -ScriptBlock { Start-ADSyncSyncCycle -PolicyType Delta } -Credential (Get-Credential)
-    if ($sync.Result -eq "Success") {
-        "LOG : AD Sync successful"
-    }
-    else {
-        "LOG : AD Sync failed"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "AttributeAction" -Value "None"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "Attribute" -Value "None"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "Values" -Value "None"
     }
 }
 
@@ -375,29 +371,35 @@ function Test-ValidUser {
 
     # check if a user has a direct ID match (direct verification of identity)
     if ($IDUser = Get-ADUser -LDAPFilter "(EmployeeID=$($UserData.EmployeeId))" @ADUserProperties -Server $Server) {
-        "LOG : ID match [$($IDUser.EmployeeID)] found to user [$($IDUser.DisplayName)]."
+        $LogObject | Add-Member -MemberType NoteProperty -Name "Match" -Value "ID"
+
         Compare-UserProperties -UserData $UserData -DifferenceData $IDUser
     }
     # elseif (no direct match) match by UPN
     elseif ($UPNUser = Get-ADUser -LDAPFilter "(UserPrincipalName=$($UserData.UserPrincipalName))" @ADUserProperties -Server $Server) {
-        "LOG : UPN match [$($UPNUser.UserPrincipalName)] found."
+        $LogObject | Add-Member -MemberType NoteProperty -Name "Match" -Value "UserPrincipalName"
+
         Compare-UserProperties -UserData $UserData -DifferenceData $UPNUser
     }
     # else (no direct match) match by UPN
     else {
-        "LOG : No users match, creating user [$($UserData.DisplayName)] with Id [$($UserData.EmployeeId)]"
-        $UserData
-        "LOG : Creating user in AD"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "Match" -Value "None"
+        $LogObject | Add-Member -MemberType NoteProperty -Name "AttributeAction" -Value "Create"
+
         New-ADUser @UserData -WhatIf:$WhatIfPreference
     }
 }
 
 <#
+Start the transcript
 Check if log folder exists, if not create it
 Define the path of users to import (source)
 Import the source users
 Import the configuration data
+Build the log object and add the current date/time
 #>
+Start-Transcript -Path $PSScriptRoot\log\transcript.log -WhatIf:$false
+
 if (-not (Test-Path -Path "$PSScriptRoot\log")) {
     New-Item -Path $PSScriptRoot -Name "log" -ItemType Directory | Out-Null
 }
@@ -409,80 +411,83 @@ $Script:UserInfo = Get-Content "$PSScriptRoot\config\config.json" | ConvertFrom-
 $Server = $UserInfo.ActiveDirectory.Server
 $Credential = (Get-Credential)
 
+$Script:LogObject = [System.Collections.Generic.List[psobject]]::new()
+$CurrentDateTime = (Get-Date).ToString("yyyy-MM-ddThh:mm:ss tt").Replace("T", " ")
+
+$LogObject.Add([PSCustomObject]@{
+        Date = $CurrentDateTime
+    })
+
+# main loop over csv data
 $UserDataCSVImport | ForEach-Object {
-    # csv columns
+    # grab csv columns
     $BuildingTitleCase = (Get-Culture).TextInfo.ToTitleCase($PSItem.School).Split('-')[0].trim()
     $UserLocalID = $PSItem.'Id Number'
-    $LastNameTitleCase = $PSItem.'Last Name'
-    $FirstNameTitleCase = $PSItem.'First Name'
-    $CourseTitleCase = (Get-Culture).TextInfo.ToTitleCase($PSItem.'Course Name')
+    $LastName = $PSItem.'Last Name'
+    $FirstName = $PSItem.'First Name'
+    $DepartmentTitleCase = (Get-Culture).TextInfo.ToTitleCase($PSItem.'Course Name')
     $EmailAddress = $PSItem.'Student Email Address'
 
-    # calculate config values
-    $UserTitle = $UserInfo.Static.Title
-    $UserCompany = $UserInfo.Static.Company
-    $UserState = $UserInfo.Static.State
-    $UserCountry = $UserInfo.Static.Country
+    # calculate full user name
+    $FullUserName = '{0} {1}' -f $FirstName, $LastName
 
-    switch ($BuildingTitleCase) {
-        $PSItem {
-            Write-Verbose -Message "User located in $PSItem"
-            $UserCity = "$($UserInfo.Buildings.$PSItem.City)"
-            $UserAddress = "$($UserInfo.Buildings.$PSItem.Address)"
-            $UserZip = "$($UserInfo.Buildings.$PSItem.Zip)"
-            $Description = "$($UserInfo.Descriptions.$PSItem.$CourseTitleCase)"
-            $Path = "OU=$Description,OU=$PSItem,$($UserInfo.ActiveDirectory.UserOrgRoot)"
+    # handle import csv building not matching JSON buildings
+    if ($UserInfo.Buildings.PSObject.Properties.Name -contains $BuildingTitleCase) {
+        # handle description not existing under building
+        if ($UserInfo.Descriptions.$BuildingTitleCase.PSObject.Properties.Name -notcontains $DepartmentTitleCase) {
+            "ERROR : Description [$DepartmentTitleCase] not found under [$BuildingTitleCase] for user [$FullUserName]"
         }
-        Default { "LOG : Building for [$FullUserName] does not match config file." }
+        else {
+            $UserCity = "$($UserInfo.Buildings.$BuildingTitleCase.City)"
+            $UserAddress = "$($UserInfo.Buildings.$BuildingTitleCase.Address)"
+            $UserZip = "$($UserInfo.Buildings.$BuildingTitleCase.Zip)"
+            $Description = "$($UserInfo.Descriptions.$BuildingTitleCase.$DepartmentTitleCase)"
+            $Path = "OU=$Description,OU=$BuildingTitleCase,$($UserInfo.ActiveDirectory.UserOrgRoot)"
+        }
+    }
+    else {
+        "ERROR : Building data [$BuildingTitleCase] is incorrect for [$FullUserName]"
     }
 
     # calculate default password
     $UserPassword = $UserInfo.Static.DefaultPasswordPrefix + $UserLocalID
 
-    # calculate full user name
-    $FullUserName = '{0} {1}' -f $FirstNameTitleCase, $LastNameTitleCase
-
     # calculate email address; verify address matches approved emails
     $Username = $EmailAddress.Split("@")[0]
-    
+
     if ($EmailAddress -notmatch $UserInfo.Static.EmailDomain) {
-        "LOG : Email address for [$FullUserName] ($EmailAddress) does not match company standard [$($UserInfo.Static.EmailDomain)]. This issue can be resolved by updating the student record in the SIS."
+        "ERROR : Email address for [$FullUserName] ($EmailAddress) does not match company standard [$($UserInfo.Static.EmailDomain)]. This issue can be resolved by updating the student record in the SIS."
         return
     }
-    
-    Write-Verbose -Message "Modified CSV data
-    Campus = $BuildingTitleCase
-    User ID = $UserLocalID
-    Full Name = $FullUserName
-    First Name = $FirstNameTitleCase
-    Last Name = $LastNameTitleCase
-    Course = $CourseTitleCase
-    Password = $UserPassword
-    Username = $Username
-    "
+
+    # log basic user identifying data
+    $LogObject | Add-Member -MemberType NoteProperty -Name "Building" -Value $BuildingTitleCase
+    $LogObject | Add-Member -MemberType NoteProperty -Name "User" -Value $FullUserName
+    $LogObject | Add-Member -MemberType NoteProperty -Name "UserPrincipalName" -Value $EmailAddress
+    $LogObject | Add-Member -MemberType NoteProperty -Name "ID" -Value $UserLocalID
 
     # define correct user data
     $NewUserParams = @{
-        'Name'                 = '{0} {1}' -f $FirstNameTitleCase, $LastNameTitleCase
-        'GivenName'            = $FirstNameTitleCase
-        'Surname'              = $LastNameTitleCase
+        'Name'                 = $FullUserName
+        'GivenName'            = $FirstName
+        'Surname'              = $LastName
         'DisplayName'          = $FullUserName
         'EmailAddress'         = $EmailAddress
         'SamAccountName'       = $Username
         'UserPrincipalName'    = $EmailAddress
         'AccountPassword'      = (ConvertTo-SecureString $UserPassword -AsPlainText -Force)
         'City'                 = $UserCity
-        'Company'              = $UserCompany
+        'Company'              = $UserInfo.Static.Company
         'Description'          = $Description
         'Office'               = $BuildingTitleCase
         'StreetAddress'        = $UserAddress
-        'State'                = $UserState
+        'State'                = $UserInfo.Static.State
         'PostalCode'           = $UserZip
-        'Country'              = $UserCountry
+        'Country'              = $UserInfo.Static.Country
         'PasswordNeverExpires' = $true
         'CannotChangePassword' = $true
         'EmployeeID'           = $UserLocalID
-        'Title'                = $UserTitle
+        'Title'                = $UserInfo.Static.Title
         'Enabled'              = $true
         'Path'                 = $Path
         'Server'               = $Server
@@ -492,6 +497,12 @@ $UserDataCSVImport | ForEach-Object {
     # Verify this user against Active Directory, modify any incorrect data from existing accounts
     Test-ValidUser -UserData $NewUserParams
 
+    #final log commit
+    $LogObject
+    $LogObject | Export-Csv -Path $PSScriptRoot\log\testlog.csv -NoTypeInformation -WhatIf:$false -Append
+
     # Run GCDS sync
     # Call password reset function
 }
+
+Stop-Transcript
